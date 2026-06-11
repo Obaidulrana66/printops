@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>PrintOps — 3D Business Manager</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',system-ui,sans-serif}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:#161b22}
+::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+select option{background:#161b22;color:#e6edf3}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spin{animation:spin 1s linear infinite;display:inline-block}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+const STORAGE_KEY="printops_v1";
+const DRIVE_FILE="printops_data.json";
+const STATUSES=["Quote","Confirmed","Printing","Post-Process","Ready","Delivered","Cancelled"];
+const STATUS_COLOR={Quote:"#64748b",Confirmed:"#3b82f6",Printing:"#f97316","Post-Process":"#a855f7",Ready:"#22c55e",Delivered:"#06b6d4",Cancelled:"#ef4444"};
+const STATUS_BG={Quote:"#1e2533",Confirmed:"#1a2540",Printing:"#2d1f0e","Post-Process":"#2a1d36",Ready:"#162419",Delivered:"#0f2530",Cancelled:"#2a1515"};
+const MAT_TYPES=["PLA","PETG","ABS","TPU","ASA","Resin","Nylon","CF Fiber","Wood Fill","Other"];
+const DELIVERY_TYPES=["Pickup","Courier","Hand Delivery"];
+const CURRENCIES=["BDT","USD","EUR","GBP","INR","SGD","AED"];
+
+function dbLoad(){try{const v=localStorage.getItem(STORAGE_KEY);return Promise.resolve(v?JSON.parse(v):null);}catch{return Promise.resolve(null);}}
+function dbSave(d){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(d));}catch(e){console.warn(e);}}
+const initData=()=>({customers:[],orders:[],materials:[],currency:"BDT"});
+const calcOrder=o=>{const mat=(o.materialGrams||0)*(o.materialCostPerGram||0);const elec=(o.printTimeHours||0)*(o.electricityCostPerHour||0);const total=mat+elec+(o.laborCost||0)+(o.otherCosts||0);const due=Math.max(0,(o.quotedPrice||0)-(o.advancePaid||0));return{...o,materialCost:mat,electricityCost:elec,totalCost:total,due};};
+const fmtMoney=(n,cur="BDT")=>`${cur} ${Number(n||0).toLocaleString("en-IN",{maximumFractionDigits:0})}`;
+const fmtDate=d=>d?new Date(d).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric"}):"—";
+const todayStr=()=>new Date().toISOString().split("T")[0];
+
+const S={
+  card:(x={})=>({background:"#161b22",border:"1px solid #21262d",borderRadius:12,padding:16,...x}),
+  btn:(bg="#f97316",x={})=>({background:bg,color:"#fff",border:"none",borderRadius:8,padding:"8px 16px",cursor:"pointer",fontSize:13,fontWeight:600,whiteSpace:"nowrap",...x}),
+  ghost:(x={})=>({background:"transparent",color:"#8b949e",border:"1px solid #30363d",borderRadius:8,padding:"7px 14px",cursor:"pointer",fontSize:13,whiteSpace:"nowrap",...x}),
+  inp:(x={})=>({background:"#0d1117",border:"1px solid #30363d",borderRadius:8,color:"#e6edf3",padding:"8px 12px",fontSize:13,width:"100%",boxSizing:"border-box",outline:"none",...x}),
+  row:(x={})=>({display:"flex",gap:12,...x}),
+  col:(x={})=>({display:"flex",flexDirection:"column",gap:12,...x}),
+  label:{display:"block",fontSize:11,color:"#8b949e",marginBottom:4,textTransform:"uppercase",letterSpacing:0.5},
+};
+
+/* ── Drive API ── */
+async function driveReq(token,path,opts={}){
+  const res=await fetch(`https://www.googleapis.com/drive/v3/${path}`,{...opts,headers:{Authorization:`Bearer ${token}`,...(opts.rawBody?{}:{"Content-Type":"application/json"}),...(opts.headers||{})}});
+  if(res.status===204)return null;
+  if(!res.ok){const t=await res.text();throw new Error(t);}
+  try{return await res.json();}catch{return null;}
+}
+async function driveGetFileId(token){
+  const r=await driveReq(token,`files?spaces=appDataFolder&q=name%3D%22${DRIVE_FILE}%22&fields=files(id)`);
+  if(r?.files?.length>0)return r.files[0].id;
+  const f=await driveReq(token,"files",{method:"POST",body:JSON.stringify({name:DRIVE_FILE,parents:["appDataFolder"]})});
+  return f.id;
+}
+async function driveUpload(token,fileId,data){
+  await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,{method:"PATCH",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify({...data,_syncedAt:new Date().toISOString()})});
+}
+async function driveDownload(token,fileId){
+  const res=await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,{headers:{Authorization:`Bearer ${token}`}});
+  if(!res.ok)return null;
+  try{return await res.json();}catch{return null;}
+}
+
+/* ── Shared Components ── */
+function StatusBadge({status}){return <span style={{background:STATUS_BG[status]||"#1a1a1a",color:STATUS_COLOR[status]||"#888",border:`1px solid ${STATUS_COLOR[status]||"#888"}50`,borderRadius:20,padding:"2px 10px",fontSize:11,fontWeight:600,whiteSpace:"nowrap"}}>{status}</span>;}
+function MetricCard({icon,label,value,sub,color="#f97316"}){return(<div style={S.card({display:"flex",alignItems:"flex-start",gap:12})}><div style={{width:44,height:44,background:`${color}20`,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{icon}</div><div style={{minWidth:0}}><div style={{fontSize:11,color:"#6b7280",textTransform:"uppercase",letterSpacing:0.5}}>{label}</div><div style={{fontSize:20,fontWeight:800,color,lineHeight:1.2}}>{value}</div>{sub&&<div style={{fontSize:11,color:"#6b7280"}}>{sub}</div>}</div></div>);}
+function Modal({title,onClose,children,wide=false}){return(<div style={{position:"fixed",inset:0,background:"#000000cc",zIndex:200,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:20,overflowY:"auto"}}><div style={{background:"#161b22",border:"1px solid #30363d",borderRadius:16,width:"100%",maxWidth:wide?740:500,marginTop:40,marginBottom:40}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 20px",borderBottom:"1px solid #21262d"}}><div style={{fontSize:15,fontWeight:700}}>{title}</div><button onClick={onClose} style={{background:"none",border:"none",color:"#8b949e",cursor:"pointer",fontSize:22,lineHeight:1,padding:"0 4px"}}>×</button></div><div style={{padding:20}}>{children}</div></div></div>);}
+function ProgressBar({pct,color="#22c55e"}){return(<div style={{background:"#21262d",borderRadius:4,height:6,overflow:"hidden"}}><div style={{width:`${Math.min(100,Math.max(0,pct))}%`,background:color,borderRadius:4,height:"100%",transition:"width 0.4s"}}/></div>);}
+
+function SyncBadge({status,user,onSignIn,onSignOut}){
+  const cfg={idle:{bg:"#21262d",col:"#6b7280",icon:"☁️",txt:"Not connected"},connecting:{bg:"#1a2540",col:"#3b82f6",icon:"⟳",txt:"Connecting...",spin:true},syncing:{bg:"#2d2010",col:"#f97316",icon:"⟳",txt:"Syncing...",spin:true},synced:{bg:"#162419",col:"#22c55e",icon:"✓",txt:"Synced"},error:{bg:"#2a1515",col:"#ef4444",icon:"✕",txt:"Sync error"}}[status]||{bg:"#21262d",col:"#6b7280",icon:"☁️",txt:status};
+  if(!user)return(<button onClick={onSignIn} style={{background:"#1a2540",color:"#60a5fa",border:"1px solid #3b82f644",borderRadius:6,padding:"5px 12px",cursor:"pointer",fontSize:11,fontWeight:600,display:"flex",alignItems:"center",gap:5}}><span>🔵</span><span>Connect Google</span></button>);
+  return(<div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}><div style={{background:cfg.bg,border:`1px solid ${cfg.col}44`,borderRadius:6,padding:"4px 10px",fontSize:11,fontWeight:600,color:cfg.col,display:"flex",alignItems:"center",gap:4}}><span className={cfg.spin?"spin":""}>{cfg.icon}</span><span>{cfg.txt}</span></div>{user.picture&&<img src={user.picture} style={{width:24,height:24,borderRadius:"50%",border:`1px solid ${cfg.col}66`}} referrerPolicy="no-referrer"/>}<button onClick={onSignOut} title={`Sign out ${user.email}`} style={{background:"none",border:"1px solid #30363d",borderRadius:6,padding:"4px 8px",cursor:"pointer",color:"#6b7280",fontSize:11}}>Sign out</button></div>);
+}
+
+/* ── Dashboard ── */
+function Dashboard({data,currency,setTab,setDetailId,onStatusChange}){
+  const orders=data.orders;
+  const active=orders.filter(o=>!["Delivered","Cancelled"].includes(o.status));
+  const delivered=orders.filter(o=>o.status==="Delivered");
+  const totalRev=delivered.reduce((s,o)=>s+(o.quotedPrice||0),0);
+  const totalDue=orders.filter(o=>o.status!=="Cancelled").reduce((s,o)=>s+Math.max(0,(o.quotedPrice||0)-(o.advancePaid||0)),0);
+  const readyNow=orders.filter(o=>o.status==="Ready");
+  const printing=orders.filter(o=>o.status==="Printing");
+  const overdue=active.filter(o=>o.deadline&&new Date(o.deadline)<new Date());
+  const recent=[...orders].sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).slice(0,8);
+  const lowMats=data.materials.filter(m=>(m.totalGrams-m.usedGrams)<(m.threshold||200));
+  return(<div style={S.col()}>
+    <div style={{fontSize:20,fontWeight:800,color:"#f97316"}}>Dashboard Overview</div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:10}}>
+      <MetricCard icon="📦" label="Total Orders" value={orders.length} sub={`${active.length} active`} color="#3b82f6"/>
+      <MetricCard icon="🖨️" label="Printing Now" value={printing.length} sub="in progress" color="#f97316"/>
+      <MetricCard icon="✅" label="Ready/Pickup" value={readyNow.length} sub="awaiting customer" color="#22c55e"/>
+      <MetricCard icon="💰" label="Revenue" value={fmtMoney(totalRev,currency)} sub={`${delivered.length} delivered`} color="#a855f7"/>
+      <MetricCard icon="⏳" label="Outstanding Due" value={fmtMoney(totalDue,currency)} sub="unpaid balance" color="#ef4444"/>
+      <MetricCard icon="👥" label="Customers" value={data.customers.length} color="#06b6d4"/>
+    </div>
+    {readyNow.length>0&&(<div style={{background:"#162419",border:"1px solid #22c55e44",borderRadius:10,padding:12}}>
+      <div style={{color:"#22c55e",fontWeight:700,fontSize:13,marginBottom:8}}>🟢 {readyNow.length} Ready for Pickup/Delivery</div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+        {readyNow.map(o=>{const cust=data.customers.find(c=>c.id===o.customerId);const co=calcOrder(o);return(<div key={o.id} style={{background:"#0f2010",border:"1px solid #22c55e44",borderRadius:8,padding:"6px 10px",fontSize:12,display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}><span style={{color:"#22c55e",fontWeight:600}}>{o.orderName}</span><span style={{color:"#6b7280"}}>— {cust?.name||"?"}</span>{co.due>0&&<span style={{color:"#ef4444"}}>{fmtMoney(co.due,currency)} due</span>}<button onClick={()=>onStatusChange(o.id,"Delivered")} style={{background:"#22c55e",color:"#fff",border:"none",borderRadius:4,padding:"2px 8px",cursor:"pointer",fontSize:11}}>✓ Delivered</button></div>);})}
+      </div>
+    </div>)}
+    {overdue.length>0&&(<div style={{background:"#2a1515",border:"1px solid #ef444444",borderRadius:10,padding:12}}>
+      <div style={{color:"#ef4444",fontWeight:700,fontSize:13,marginBottom:6}}>⚠️ {overdue.length} Overdue</div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:6}}>{overdue.map(o=>{const cust=data.customers.find(c=>c.id===o.customerId);return<span key={o.id} style={{background:"#3a1515",border:"1px solid #ef444433",borderRadius:6,padding:"3px 10px",fontSize:12,color:"#ef4444"}}>{o.orderName} ({cust?.name||"?"}) — {fmtDate(o.deadline)}</span>;})}</div>
+    </div>)}
+    {lowMats.length>0&&(<div style={{background:"#2d2010",border:"1px solid #f9731644",borderRadius:10,padding:12}}>
+      <div style={{color:"#f97316",fontWeight:700,fontSize:13,marginBottom:6}}>🧵 Low Stock</div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:6}}>{lowMats.map(m=><span key={m.id} style={{background:"#2a1e0e",border:"1px solid #f9731633",borderRadius:6,padding:"3px 10px",fontSize:12,color:"#f97316"}}>{m.name}: {Math.round(m.totalGrams-m.usedGrams)}g left</span>)}</div>
+    </div>)}
+    <div style={S.card()}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}><div style={{fontWeight:700}}>Recent Orders</div><button onClick={()=>setTab("orders")} style={S.ghost({fontSize:11})}>View All →</button></div>
+      {recent.length===0?<div style={{textAlign:"center",color:"#6b7280",padding:"32px 0"}}>No orders yet.</div>:(
+        <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+          <thead><tr style={{borderBottom:"1px solid #21262d"}}>{["Order","Customer","Status","Quoted","Advance","Due","Deadline"].map(h=><th key={h} style={{padding:"6px 8px",textAlign:"left",color:"#6b7280",fontWeight:600,fontSize:11,whiteSpace:"nowrap"}}>{h}</th>)}</tr></thead>
+          <tbody>{recent.map(o=>{const cust=data.customers.find(c=>c.id===o.customerId);const co=calcOrder(o);return(<tr key={o.id} style={{borderBottom:"1px solid #21262d44",cursor:"pointer"}} onMouseEnter={e=>e.currentTarget.style.background="#ffffff08"} onMouseLeave={e=>e.currentTarget.style.background="transparent"} onClick={()=>{setDetailId(o.id);setTab("orders");}}><td style={{padding:"8px",fontWeight:600,color:"#f97316"}}>{o.orderName}</td><td style={{padding:"8px",color:"#8b949e"}}>{cust?.name||"—"}</td><td style={{padding:"8px"}}><StatusBadge status={o.status}/></td><td style={{padding:"8px"}}>{fmtMoney(o.quotedPrice,currency)}</td><td style={{padding:"8px",color:"#22c55e"}}>{fmtMoney(o.advancePaid,currency)}</td><td style={{padding:"8px",color:co.due>0?"#ef4444":"#22c55e"}}>{fmtMoney(co.due,currency)}</td><td style={{padding:"8px",color:"#6b7280"}}>{fmtDate(o.deadline)}</td></tr>);})}</tbody>
+        </table></div>
+      )}
+    </div>
+  </div>);
+}
+
+/* ── Customer Form & View ── */
+const emptyCust=()=>({name:"",phone:"",email:"",address:"",notes:""});
+function CustomerForm({initial,onSave,onClose}){const [f,setF]=useState(initial||emptyCust());const set=(k,v)=>setF(p=>({...p,[k]:v}));return(<div style={S.col()}><div style={S.row()}><div style={{flex:1}}><div style={S.label}>Full Name *</div><input style={S.inp()} value={f.name} onChange={e=>set("name",e.target.value)} placeholder="Customer name"/></div><div style={{flex:1}}><div style={S.label}>Phone</div><input style={S.inp()} value={f.phone} onChange={e=>set("phone",e.target.value)} placeholder="+880..."/></div></div><div><div style={S.label}>Email</div><input style={S.inp()} type="email" value={f.email} onChange={e=>set("email",e.target.value)} placeholder="email@example.com"/></div><div><div style={S.label}>Address</div><textarea style={{...S.inp(),resize:"vertical",minHeight:60}} value={f.address} onChange={e=>set("address",e.target.value)} placeholder="Billing / delivery address"/></div><div><div style={S.label}>Notes</div><textarea style={{...S.inp(),resize:"vertical",minHeight:50}} value={f.notes} onChange={e=>set("notes",e.target.value)}/></div><div style={S.row({justifyContent:"flex-end"})}><button onClick={onClose} style={S.ghost()}>Cancel</button><button onClick={()=>f.name.trim()&&onSave(f)} style={S.btn()}>Save Customer</button></div></div>);}
+
+function Customers({data,save,currency,view,setView,setDetailId,setTab}){
+  const [showForm,setShowForm]=useState(false);const [editing,setEditing]=useState(null);const [search,setSearch]=useState("");
+  const filtered=data.customers.filter(c=>c.name.toLowerCase().includes(search.toLowerCase())||c.phone?.includes(search)||c.email?.toLowerCase().includes(search.toLowerCase()));
+  const addCust=f=>{save(d=>({...d,customers:[...d.customers,{...f,id:`c${Date.now()}`,createdAt:new Date().toISOString()}]}));setShowForm(false);};
+  const updCust=(id,f)=>{save(d=>({...d,customers:d.customers.map(c=>c.id===id?{...c,...f}:c)}));setEditing(null);};
+  const delCust=id=>{if(!confirm("Delete this customer?"))return;save(d=>({...d,customers:d.customers.filter(c=>c.id!==id)}));if(view===id)setView(null);};
+  const custOrders=id=>data.orders.filter(o=>o.customerId===id);
+  const custDue=id=>data.orders.filter(o=>o.customerId===id&&o.status!=="Cancelled").reduce((s,o)=>s+Math.max(0,(o.quotedPrice||0)-(o.advancePaid||0)),0);
+  if(view){
+    const cust=data.customers.find(c=>c.id===view);if(!cust){setView(null);return null;}
+    const orders=custOrders(view);const totalPaid=orders.reduce((s,o)=>s+(o.advancePaid||0),0);const due=custDue(view);
+    return(<div style={S.col()}><div style={S.row({alignItems:"center"})}><button onClick={()=>setView(null)} style={S.ghost()}>← Back</button><div style={{fontSize:18,fontWeight:800,color:"#f97316"}}>{cust.name}</div><button onClick={()=>setEditing(cust)} style={{...S.ghost(),marginLeft:"auto"}}>✏️ Edit</button></div><div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:10}}><MetricCard icon="📦" label="Orders" value={orders.length} color="#3b82f6"/><MetricCard icon="✅" label="Delivered" value={orders.filter(o=>o.status==="Delivered").length} color="#22c55e"/><MetricCard icon="💳" label="Total Paid" value={fmtMoney(totalPaid,currency)} color="#06b6d4"/><MetricCard icon="⏳" label="Due" value={fmtMoney(due,currency)} color="#ef4444"/></div><div style={S.card({fontSize:13})}><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>{cust.phone&&<div>📞 {cust.phone}</div>}{cust.email&&<div>✉️ {cust.email}</div>}{cust.address&&<div style={{gridColumn:"1/-1"}}>📍 {cust.address}</div>}{cust.notes&&<div style={{gridColumn:"1/-1",color:"#8b949e",fontStyle:"italic"}}>💬 {cust.notes}</div>}</div></div><div style={{fontWeight:700,marginTop:4}}>Order History ({orders.length})</div>{orders.length===0?<div style={{color:"#6b7280",textAlign:"center",padding:24}}>No orders yet.</div>:orders.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).map(o=>{const co=calcOrder(o);return(<div key={o.id} style={{...S.card(),cursor:"pointer"}} onClick={()=>{setDetailId(o.id);setView(null);setTab("orders");}}><div style={S.row({justifyContent:"space-between",alignItems:"flex-start"})}><div><div style={{fontWeight:700,color:"#f97316"}}>{o.orderName}</div><div style={{fontSize:12,color:"#6b7280"}}>{fmtDate(o.orderDate)} · {o.material} · {o.materialGrams}g</div></div><StatusBadge status={o.status}/></div><div style={S.row({marginTop:8,fontSize:12,gap:16})}><span>💰 {fmtMoney(o.quotedPrice,currency)}</span><span style={{color:"#22c55e"}}>✓ {fmtMoney(o.advancePaid,currency)}</span>{co.due>0&&<span style={{color:"#ef4444"}}>⏳ {fmtMoney(co.due,currency)}</span>}</div></div>);})}{editing&&<Modal title="Edit Customer" onClose={()=>setEditing(null)}><CustomerForm initial={editing} onSave={f=>updCust(editing.id,f)} onClose={()=>setEditing(null)}/></Modal>}</div>);
+  }
+  return(<div style={S.col()}><div style={S.row({alignItems:"center"})}><div style={{fontSize:20,fontWeight:800,color:"#f97316"}}>Customers</div><button onClick={()=>setShowForm(true)} style={{...S.btn(),marginLeft:"auto"}}>+ Add Customer</button></div><input style={S.inp()} placeholder="🔍 Search..." value={search} onChange={e=>setSearch(e.target.value)}/>{filtered.length===0?<div style={{textAlign:"center",color:"#6b7280",padding:48}}>{data.customers.length===0?"No customers yet.":"No match."}</div>:<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(270px,1fr))",gap:12}}>{filtered.map(c=>{const ord=custOrders(c.id);const due=custDue(c.id);return(<div key={c.id} style={{...S.card(),cursor:"pointer",transition:"border-color 0.15s"}} onMouseEnter={e=>e.currentTarget.style.borderColor="#f97316"} onMouseLeave={e=>e.currentTarget.style.borderColor="#21262d"} onClick={()=>setView(c.id)}><div style={S.row({justifyContent:"space-between",alignItems:"flex-start"})}><div><div style={{fontWeight:700,fontSize:15}}>{c.name}</div>{c.phone&&<div style={{fontSize:12,color:"#8b949e"}}>📞 {c.phone}</div>}{c.email&&<div style={{fontSize:12,color:"#8b949e"}}>✉️ {c.email}</div>}</div><button onClick={e=>{e.stopPropagation();delCust(c.id);}} style={{background:"none",border:"none",color:"#6b7280",cursor:"pointer",fontSize:15}}>🗑</button></div><div style={{...S.row({marginTop:10,fontSize:12,gap:12,flexWrap:"wrap"}),borderTop:"1px solid #21262d",paddingTop:10}}><span style={{color:"#3b82f6"}}>📦 {ord.length} orders</span><span style={{color:"#22c55e"}}>✓ {ord.filter(o=>o.status==="Delivered").length} done</span>{due>0&&<span style={{color:"#ef4444"}}>⏳ {fmtMoney(due,currency)} due</span>}</div></div>);})}</div>}{showForm&&<Modal title="Add Customer" onClose={()=>setShowForm(false)}><CustomerForm onSave={addCust} onClose={()=>setShowForm(false)}/></Modal>}{editing&&<Modal title="Edit Customer" onClose={()=>setEditing(null)}><CustomerForm initial={editing} onSave={f=>updCust(editing.id,f)} onClose={()=>setEditing(null)}/></Modal>}</div>);
+}
+
+/* ── Order Form ── */
+const emptyOrder=()=>({customerId:"",orderName:"",description:"",status:"Quote",priority:"Normal",modelFile:"",material:"PLA",materialColor:"",materialGrams:"",materialCostPerGram:"",printTimeHours:"",electricityCostPerHour:"",laborCost:"",otherCosts:"",quotedPrice:"",advancePaid:"",orderDate:todayStr(),deadline:"",deliveryMethod:"Pickup",deliveryAddress:"",deliveryDate:"",notes:""});
+function OrderForm({initial,customers,onSave,onClose}){
+  const [f,setF]=useState(initial||emptyOrder());const set=(k,v)=>setF(p=>({...p,[k]:v}));const n=v=>parseFloat(v)||0;
+  const co=calcOrder({...f,materialGrams:n(f.materialGrams),materialCostPerGram:n(f.materialCostPerGram),printTimeHours:n(f.printTimeHours),electricityCostPerHour:n(f.electricityCostPerHour),laborCost:n(f.laborCost),otherCosts:n(f.otherCosts),quotedPrice:n(f.quotedPrice),advancePaid:n(f.advancePaid)});
+  const Sec=({t})=><div style={{fontWeight:700,color:"#f97316",fontSize:12,textTransform:"uppercase",letterSpacing:1,marginTop:8,paddingTop:8,borderTop:"1px solid #21262d"}}>{t}</div>;
+  return(<div style={S.col()}>
+    <Sec t="Basic Info"/>
+    <div style={S.row({flexWrap:"wrap"})}><div style={{flex:2,minWidth:160}}><div style={S.label}>Customer *</div><select style={{...S.inp(),appearance:"none"}} value={f.customerId} onChange={e=>set("customerId",e.target.value)}><option value="">Select customer...</option>{customers.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></div><div style={{flex:1,minWidth:120}}><div style={S.label}>Priority</div><select style={{...S.inp(),appearance:"none"}} value={f.priority} onChange={e=>set("priority",e.target.value)}>{["Normal","Urgent","Rush"].map(p=><option key={p}>{p}</option>)}</select></div></div>
+    <div><div style={S.label}>Order Name *</div><input style={S.inp()} value={f.orderName} onChange={e=>set("orderName",e.target.value)} placeholder="e.g. Batman Keycap × 10..."/></div>
+    <div><div style={S.label}>Description</div><textarea style={{...S.inp(),resize:"vertical",minHeight:56}} value={f.description} onChange={e=>set("description",e.target.value)} placeholder="Details..."/></div>
+    <div style={S.row({flexWrap:"wrap"})}><div style={{flex:1,minWidth:130}}><div style={S.label}>Order Date</div><input style={S.inp()} type="date" value={f.orderDate} onChange={e=>set("orderDate",e.target.value)}/></div><div style={{flex:1,minWidth:130}}><div style={S.label}>Deadline</div><input style={S.inp()} type="date" value={f.deadline} onChange={e=>set("deadline",e.target.value)}/></div><div style={{flex:1,minWidth:130}}><div style={S.label}>Status</div><select style={{...S.inp(),appearance:"none"}} value={f.status} onChange={e=>set("status",e.target.value)}>{STATUSES.map(s=><option key={s}>{s}</option>)}</select></div></div>
+    <div><div style={S.label}>Model File</div><input style={S.inp()} value={f.modelFile} onChange={e=>set("modelFile",e.target.value)} placeholder="model_v3.stl, batman.3mf..."/></div>
+    <Sec t="Print Cost Breakdown"/>
+    <div style={S.row({flexWrap:"wrap"})}><div style={{flex:2,minWidth:140}}><div style={S.label}>Material</div><select style={{...S.inp(),appearance:"none"}} value={f.material} onChange={e=>set("material",e.target.value)}>{MAT_TYPES.map(m=><option key={m}>{m}</option>)}</select></div><div style={{flex:1,minWidth:100}}><div style={S.label}>Color</div><input style={S.inp()} value={f.materialColor} onChange={e=>set("materialColor",e.target.value)} placeholder="Black"/></div></div>
+    <div style={S.row({flexWrap:"wrap"})}><div style={{flex:1,minWidth:110}}><div style={S.label}>Grams Used</div><input style={S.inp()} type="number" value={f.materialGrams} onChange={e=>set("materialGrams",e.target.value)} placeholder="45"/></div><div style={{flex:1,minWidth:110}}><div style={S.label}>Cost/gram</div><input style={S.inp()} type="number" value={f.materialCostPerGram} onChange={e=>set("materialCostPerGram",e.target.value)} placeholder="2.5"/></div><div style={{flex:1,minWidth:110}}><div style={S.label}>Mat. Cost (auto)</div><div style={{...S.inp({color:"#f97316",fontWeight:700}),background:"#2d1f0e"}}>{fmtMoney(co.materialCost)}</div></div></div>
+    <div style={S.row({flexWrap:"wrap"})}><div style={{flex:1,minWidth:110}}><div style={S.label}>Print Hours</div><input style={S.inp()} type="number" value={f.printTimeHours} onChange={e=>set("printTimeHours",e.target.value)} placeholder="3.5"/></div><div style={{flex:1,minWidth:110}}><div style={S.label}>Elec. cost/hr</div><input style={S.inp()} type="number" value={f.electricityCostPerHour} onChange={e=>set("electricityCostPerHour",e.target.value)} placeholder="5"/></div><div style={{flex:1,minWidth:110}}><div style={S.label}>Elec. Cost (auto)</div><div style={{...S.inp({color:"#f97316",fontWeight:700}),background:"#2d1f0e"}}>{fmtMoney(co.electricityCost)}</div></div></div>
+    <div style={S.row({flexWrap:"wrap"})}><div style={{flex:1,minWidth:110}}><div style={S.label}>Labor/Design</div><input style={S.inp()} type="number" value={f.laborCost} onChange={e=>set("laborCost",e.target.value)} placeholder="0"/></div><div style={{flex:1,minWidth:110}}><div style={S.label}>Other Costs</div><input style={S.inp()} type="number" value={f.otherCosts} onChange={e=>set("otherCosts",e.target.value)} placeholder="0"/></div><div style={{flex:1,minWidth:110}}><div style={S.label}>⚡ Total Cost</div><div style={{...S.inp({color:"#22c55e",fontWeight:800}),background:"#162419"}}>{fmtMoney(co.totalCost)}</div></div></div>
+    <Sec t="Billing"/>
+    <div style={S.row({flexWrap:"wrap"})}><div style={{flex:1,minWidth:120}}><div style={S.label}>Quoted Price *</div><input style={S.inp()} type="number" value={f.quotedPrice} onChange={e=>set("quotedPrice",e.target.value)} placeholder="500"/></div><div style={{flex:1,minWidth:120}}><div style={S.label}>Advance Paid</div><input style={S.inp()} type="number" value={f.advancePaid} onChange={e=>set("advancePaid",e.target.value)} placeholder="200"/></div><div style={{flex:1,minWidth:120}}><div style={S.label}>Due (auto)</div><div style={{...S.inp({color:co.due>0?"#ef4444":"#22c55e",fontWeight:800}),background:co.due>0?"#2a1515":"#162419"}}>{fmtMoney(co.due)}</div></div></div>
+    {co.totalCost>0&&n(f.quotedPrice)>0&&<div style={{fontSize:12,color:"#6b7280",background:"#0f1117",borderRadius:6,padding:"6px 10px"}}>📊 Margin: {fmtMoney(n(f.quotedPrice)-co.totalCost)} ({Math.round((n(f.quotedPrice)-co.totalCost)/n(f.quotedPrice)*100)}%) · Cost: {fmtMoney(co.totalCost)}</div>}
+    <Sec t="Delivery"/>
+    <div style={S.row({flexWrap:"wrap"})}><div style={{flex:1,minWidth:130}}><div style={S.label}>Method</div><select style={{...S.inp(),appearance:"none"}} value={f.deliveryMethod} onChange={e=>set("deliveryMethod",e.target.value)}>{DELIVERY_TYPES.map(t=><option key={t}>{t}</option>)}</select></div><div style={{flex:1,minWidth:130}}><div style={S.label}>Delivery Date</div><input style={S.inp()} type="date" value={f.deliveryDate} onChange={e=>set("deliveryDate",e.target.value)}/></div></div>
+    {f.deliveryMethod!=="Pickup"&&<div><div style={S.label}>Address</div><input style={S.inp()} value={f.deliveryAddress} onChange={e=>set("deliveryAddress",e.target.value)} placeholder="Full delivery address..."/></div>}
+    <div><div style={S.label}>Notes</div><textarea style={{...S.inp(),resize:"vertical",minHeight:56}} value={f.notes} onChange={e=>set("notes",e.target.value)} placeholder="Special instructions..."/></div>
+    <div style={S.row({justifyContent:"flex-end"})}><button onClick={onClose} style={S.ghost()}>Cancel</button><button onClick={()=>(f.orderName.trim()&&f.customerId)&&onSave({...f,materialGrams:n(f.materialGrams),materialCostPerGram:n(f.materialCostPerGram),printTimeHours:n(f.printTimeHours),electricityCostPerHour:n(f.electricityCostPerHour),laborCost:n(f.laborCost),otherCosts:n(f.otherCosts),quotedPrice:n(f.quotedPrice),advancePaid:n(f.advancePaid),materialCost:co.materialCost,electricityCost:co.electricityCost,totalCost:co.totalCost,due:co.due})} style={S.btn()}>💾 Save Order</button></div>
+  </div>);
+}
+
+/* ── Orders View ── */
+function Orders({data,save,currency,detailId,setDetailId}){
+  const [showForm,setShowForm]=useState(false);const [editing,setEditing]=useState(null);
+  const [filterStatus,setFilterStatus]=useState("All");const [filterCust,setFilterCust]=useState("All");const [search,setSearch]=useState("");
+  const [localDetail,setLocalDetail]=useState(detailId||null);
+  const filtered=data.orders.filter(o=>{if(filterStatus!=="All"&&o.status!==filterStatus)return false;if(filterCust!=="All"&&o.customerId!==filterCust)return false;if(search){const s=search.toLowerCase();const cust=data.customers.find(c=>c.id===o.customerId);if(!o.orderName.toLowerCase().includes(s)&&!cust?.name.toLowerCase().includes(s))return false;}return true;}).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
+  const addOrder=f=>{save(d=>({...d,orders:[...d.orders,{...f,id:`o${Date.now()}`,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()}]}));setShowForm(false);};
+  const updOrder=(id,f)=>{save(d=>({...d,orders:d.orders.map(o=>o.id===id?{...o,...f,updatedAt:new Date().toISOString()}:o)}));setEditing(null);setLocalDetail(null);};
+  const delOrder=id=>{if(!confirm("Delete this order?"))return;save(d=>({...d,orders:d.orders.filter(o=>o.id!==id)}));setLocalDetail(null);};
+  const setStatus=(id,status)=>save(d=>({...d,orders:d.orders.map(o=>o.id===id?{...o,status,updatedAt:new Date().toISOString()}:o)}));
+  const detail=localDetail?data.orders.find(o=>o.id===localDetail):null;
+  if(detail){
+    const co=calcOrder(detail);const cust=data.customers.find(c=>c.id===detail.customerId);const sIdx=STATUSES.indexOf(detail.status);const mainSt=["Quote","Confirmed","Printing","Post-Process","Ready","Delivered"];
+    return(<div style={S.col()}>
+      <div style={S.row({alignItems:"center",flexWrap:"wrap",gap:8})}><button onClick={()=>setLocalDetail(null)} style={S.ghost()}>← Back</button><div style={{fontSize:17,fontWeight:800,color:"#f97316"}}>{detail.orderName}</div>{detail.priority!=="Normal"&&<span style={{background:detail.priority==="Rush"?"#ef4444":"#f97316",color:"#fff",borderRadius:4,padding:"2px 8px",fontSize:11,fontWeight:700}}>{detail.priority.toUpperCase()}</span>}<div style={{marginLeft:"auto",display:"flex",gap:8}}><button onClick={()=>setEditing(detail)} style={S.ghost()}>✏️ Edit</button><button onClick={()=>delOrder(detail.id)} style={{...S.ghost(),color:"#ef4444",borderColor:"#ef444444"}}>🗑</button></div></div>
+      <div style={S.card()}><div style={{fontSize:11,color:"#6b7280",marginBottom:10,textTransform:"uppercase",letterSpacing:0.5}}>Progress — click to update</div><div style={{display:"flex",gap:4,alignItems:"center",overflowX:"auto",paddingBottom:4}}>{mainSt.map((s,i)=>(<div key={s} style={{display:"flex",alignItems:"center",gap:4,flexShrink:0}}><div onClick={()=>setStatus(detail.id,s)} style={{background:i<sIdx?`${STATUS_COLOR[s]}30`:i===sIdx?STATUS_COLOR[s]:"#21262d",color:i<=sIdx?i===sIdx?"#fff":STATUS_COLOR[s]:"#6b7280",borderRadius:20,padding:"5px 14px",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap",border:`2px solid ${i===sIdx?STATUS_COLOR[s]:"transparent"}`,transition:"all 0.15s"}}>{s}</div>{i<5&&<div style={{width:16,height:2,background:i<sIdx?"#f97316":"#21262d",flexShrink:0}}/>}</div>))}<div onClick={()=>setStatus(detail.id,"Cancelled")} style={{background:detail.status==="Cancelled"?"#ef4444":"transparent",color:detail.status==="Cancelled"?"#fff":"#ef4444",border:"1px solid #ef444444",borderRadius:20,padding:"5px 12px",fontSize:11,fontWeight:700,cursor:"pointer",marginLeft:4,flexShrink:0}}>× Cancel</div></div></div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+        <div style={S.card({fontSize:13})}><div style={{color:"#6b7280",fontSize:11,textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Order Info</div><div style={{lineHeight:2}}><div><span style={{color:"#8b949e"}}>Customer: </span><strong style={{color:"#3b82f6"}}>{cust?.name||"?"}</strong>{cust?.phone&&<span style={{color:"#6b7280"}}> · {cust.phone}</span>}</div><div><span style={{color:"#8b949e"}}>Priority: </span>{detail.priority}</div><div><span style={{color:"#8b949e"}}>Order Date: </span>{fmtDate(detail.orderDate)}</div>{detail.deadline&&<div><span style={{color:"#8b949e"}}>Deadline: </span><span style={{color:"#ef4444"}}>{fmtDate(detail.deadline)}</span></div>}{detail.modelFile&&<div><span style={{color:"#8b949e"}}>File: </span><span style={{fontFamily:"monospace",fontSize:12}}>{detail.modelFile}</span></div>}{detail.description&&<div style={{color:"#8b949e",fontSize:12}}>{detail.description}</div>}{detail.notes&&<div style={{color:"#8b949e",fontStyle:"italic",fontSize:12}}>💬 {detail.notes}</div>}</div></div>
+        <div style={S.card({fontSize:13})}><div style={{color:"#6b7280",fontSize:11,textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Print Cost</div><div style={{lineHeight:2}}><div><span style={{color:"#8b949e"}}>Material: </span>{detail.material} {detail.materialColor}</div><div><span style={{color:"#8b949e"}}>Used: </span>{detail.materialGrams}g @ {detail.materialCostPerGram}/g = <strong>{fmtMoney(co.materialCost,currency)}</strong></div><div><span style={{color:"#8b949e"}}>Print: </span>{detail.printTimeHours}h = <strong>{fmtMoney(co.electricityCost,currency)}</strong></div>{detail.laborCost>0&&<div><span style={{color:"#8b949e"}}>Labor: </span>{fmtMoney(detail.laborCost,currency)}</div>}{detail.otherCosts>0&&<div><span style={{color:"#8b949e"}}>Other: </span>{fmtMoney(detail.otherCosts,currency)}</div>}<div style={{borderTop:"1px solid #21262d",paddingTop:4,marginTop:4}}><span style={{color:"#8b949e"}}>Total: </span><strong style={{color:"#22c55e",fontSize:15}}>{fmtMoney(co.totalCost,currency)}</strong></div></div></div>
+        <div style={S.card({fontSize:13})}><div style={{color:"#6b7280",fontSize:11,textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Billing</div><div style={{lineHeight:2}}><div><span style={{color:"#8b949e"}}>Quoted: </span><strong style={{fontSize:16}}>{fmtMoney(detail.quotedPrice,currency)}</strong></div><div><span style={{color:"#8b949e"}}>Advance: </span><span style={{color:"#22c55e",fontWeight:700}}>{fmtMoney(detail.advancePaid,currency)}</span></div><div style={{fontSize:18,fontWeight:800,color:co.due>0?"#ef4444":"#22c55e",marginTop:4}}>{co.due>0?`⏳ Due: ${fmtMoney(co.due,currency)}`:"✅ Fully Paid"}</div>{co.totalCost>0&&detail.quotedPrice>0&&<div style={{fontSize:11,color:"#6b7280"}}>Margin: {fmtMoney(detail.quotedPrice-co.totalCost,currency)} ({Math.round((detail.quotedPrice-co.totalCost)/detail.quotedPrice*100)}%)</div>}</div></div>
+        <div style={S.card({fontSize:13})}><div style={{color:"#6b7280",fontSize:11,textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>Delivery</div><div style={{lineHeight:2}}><div><span style={{color:"#8b949e"}}>Method: </span>{detail.deliveryMethod}</div>{detail.deliveryDate&&<div><span style={{color:"#8b949e"}}>Date: </span>{fmtDate(detail.deliveryDate)}</div>}{detail.deliveryAddress&&<div><span style={{color:"#8b949e"}}>Address: </span>{detail.deliveryAddress}</div>}{detail.status==="Delivered"&&<div style={{color:"#22c55e",fontWeight:700}}>✅ Delivered</div>}</div></div>
+      </div>
+      {editing&&<Modal title="Edit Order" onClose={()=>setEditing(null)} wide><OrderForm initial={editing} customers={data.customers} onSave={f=>updOrder(editing.id,f)} onClose={()=>setEditing(null)}/></Modal>}
+    </div>);
+  }
+  return(<div style={S.col()}>
+    <div style={S.row({alignItems:"center",flexWrap:"wrap",gap:8})}><div style={{fontSize:20,fontWeight:800,color:"#f97316"}}>Orders</div><button onClick={()=>setShowForm(true)} style={{...S.btn(),marginLeft:"auto"}}>+ New Order</button></div>
+    <div style={S.row({flexWrap:"wrap",gap:8})}><input style={{...S.inp(),flex:1,minWidth:160}} placeholder="🔍 Search..." value={search} onChange={e=>setSearch(e.target.value)}/><select style={{...S.inp({width:"auto"}),appearance:"none"}} value={filterStatus} onChange={e=>setFilterStatus(e.target.value)}><option value="All">All Statuses</option>{STATUSES.map(s=><option key={s}>{s}</option>)}</select><select style={{...S.inp({width:"auto"}),appearance:"none"}} value={filterCust} onChange={e=>setFilterCust(e.target.value)}><option value="All">All Customers</option>{data.customers.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
+    <div style={{fontSize:12,color:"#6b7280"}}>{filtered.length} order{filtered.length!==1?"s":""}</div>
+    {filtered.length===0?<div style={{textAlign:"center",color:"#6b7280",padding:48}}>{data.orders.length===0?"No orders yet!":"No match."}</div>:<div style={S.col({gap:8})}>{filtered.map(o=>{const co=calcOrder(o);const cust=data.customers.find(c=>c.id===o.customerId);const isOverdue=o.deadline&&new Date(o.deadline)<new Date()&&!["Delivered","Cancelled"].includes(o.status);return(<div key={o.id} style={{...S.card(),cursor:"pointer",borderColor:isOverdue?"#ef444455":"#21262d",transition:"border-color 0.15s"}} onMouseEnter={e=>e.currentTarget.style.borderColor="#f97316"} onMouseLeave={e=>e.currentTarget.style.borderColor=isOverdue?"#ef444455":"#21262d"} onClick={()=>setLocalDetail(o.id)}><div style={S.row({justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:8})}><div><div style={{fontWeight:700,color:"#f97316",fontSize:15,display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>{o.orderName}{o.priority==="Rush"&&<span style={{background:"#ef4444",color:"#fff",borderRadius:4,padding:"1px 6px",fontSize:10}}>RUSH</span>}{o.priority==="Urgent"&&<span style={{background:"#f97316",color:"#fff",borderRadius:4,padding:"1px 6px",fontSize:10}}>URGENT</span>}{isOverdue&&<span style={{background:"#ef444422",color:"#ef4444",borderRadius:4,padding:"1px 6px",fontSize:10}}>OVERDUE</span>}</div><div style={{fontSize:12,color:"#8b949e"}}>{cust?.name||"?"} · {o.material} {o.materialColor||""} · {o.materialGrams}g · {o.printTimeHours}h</div></div><StatusBadge status={o.status}/></div><div style={S.row({marginTop:8,fontSize:12,flexWrap:"wrap",gap:12})}><span>💰 {fmtMoney(o.quotedPrice,currency)}</span><span style={{color:"#22c55e"}}>✓ {fmtMoney(o.advancePaid,currency)}</span>{co.due>0&&<span style={{color:"#ef4444"}}>⏳ {fmtMoney(co.due,currency)}</span>}{o.deadline&&<span style={{color:isOverdue?"#ef4444":"#6b7280"}}>📅 {fmtDate(o.deadline)}</span>}{o.modelFile&&<span style={{color:"#6b7280",fontFamily:"monospace",fontSize:11}}>📄 {o.modelFile}</span>}</div></div>);})}
+    </div>}
+    {showForm&&<Modal title="New Order" onClose={()=>setShowForm(false)} wide><OrderForm customers={data.customers} onSave={addOrder} onClose={()=>setShowForm(false)}/></Modal>}
+  </div>);
+}
+
+/* ── Material Card & View ── */
+function MaterialCard({m,currency,onDelete,onUse}){
+  const [useAmt,setUseAmt]=useState("");
+  const rem=(m.totalGrams||0)-(m.usedGrams||0);const pct=Math.max(0,Math.min(100,(rem/(m.totalGrams||1))*100));const isLow=rem<(m.threshold||200);const barCol=pct>60?"#22c55e":pct>30?"#f97316":"#ef4444";
+  return(<div style={{...S.card(),borderColor:isLow?"#ef444444":"#21262d"}}><div style={S.row({justifyContent:"space-between",alignItems:"flex-start"})}><div><div style={{fontWeight:700}}>{m.name}</div><div style={{fontSize:11,color:"#8b949e"}}>{m.brand} · {m.type} · {m.color}</div></div><button onClick={onDelete} style={{background:"none",border:"none",color:"#6b7280",cursor:"pointer",fontSize:15}}>🗑</button></div><div style={{marginTop:10}}><div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:4}}><span style={{color:isLow?"#ef4444":"#8b949e"}}>{isLow?"⚠️ ":""}{Math.round(rem)}g / {m.totalGrams}g</span><span style={{color:"#6b7280"}}>{Math.round(pct)}%</span></div><ProgressBar pct={pct} color={barCol}/></div><div style={{fontSize:12,color:"#6b7280",marginTop:8}}>{fmtMoney(m.costPerGram,currency)}/g · Value: {fmtMoney(rem*(m.costPerGram||0),currency)}</div><div style={{...S.row({marginTop:8}),alignItems:"center"}}><input style={{...S.inp({flex:1}),padding:"5px 8px"}} type="number" placeholder="Log grams used" value={useAmt} onChange={e=>setUseAmt(e.target.value)}/><button onClick={()=>{onUse(useAmt);setUseAmt("");}} style={{...S.btn("#3b82f6"),padding:"5px 12px",fontSize:12}}>Log Use</button></div></div>);
+}
+const emptyMat=()=>({name:"",type:"PLA",color:"",brand:"",totalGrams:"1000",usedGrams:"0",costPerGram:"",threshold:"200"});
+function Materials({data,save,currency}){
+  const [showForm,setShowForm]=useState(false);const [form,setForm]=useState(emptyMat());
+  const sf=(k,v)=>setForm(f=>({...f,[k]:v}));const n=v=>parseFloat(v)||0;
+  const addMat=()=>{if(!form.name.trim())return;save(d=>({...d,materials:[...d.materials,{...form,id:`m${Date.now()}`,totalGrams:n(form.totalGrams),usedGrams:n(form.usedGrams),costPerGram:n(form.costPerGram),threshold:n(form.threshold),createdAt:new Date().toISOString()}]}));setForm(emptyMat());setShowForm(false);};
+  const delMat=id=>save(d=>({...d,materials:d.materials.filter(m=>m.id!==id)}));
+  const useMat=(id,g)=>{const gf=parseFloat(g);if(!gf||isNaN(gf))return;save(d=>({...d,materials:d.materials.map(m=>m.id===id?{...m,usedGrams:Math.min(m.totalGrams,m.usedGrams+gf)}:m)}));};
+  return(<div style={S.col()}>
+    <div style={S.row({alignItems:"center"})}><div style={{fontSize:20,fontWeight:800,color:"#f97316"}}>Materials Inventory</div><button onClick={()=>setShowForm(!showForm)} style={{...S.btn(),marginLeft:"auto"}}>+ Add Spool</button></div>
+    {showForm&&(<div style={S.card()}><div style={{fontWeight:700,marginBottom:12}}>New Spool</div><div style={S.col()}><div style={S.row({flexWrap:"wrap"})}><div style={{flex:2,minWidth:160}}><div style={S.label}>Name *</div><input style={S.inp()} value={form.name} onChange={e=>sf("name",e.target.value)} placeholder="PLA Black 1kg"/></div><div style={{flex:1,minWidth:110}}><div style={S.label}>Type</div><select style={{...S.inp(),appearance:"none"}} value={form.type} onChange={e=>sf("type",e.target.value)}>{MAT_TYPES.map(t=><option key={t}>{t}</option>)}</select></div></div><div style={S.row({flexWrap:"wrap"})}><div style={{flex:1,minWidth:90}}><div style={S.label}>Color</div><input style={S.inp()} value={form.color} onChange={e=>sf("color",e.target.value)} placeholder="Black"/></div><div style={{flex:1,minWidth:90}}><div style={S.label}>Brand</div><input style={S.inp()} value={form.brand} onChange={e=>sf("brand",e.target.value)} placeholder="Bambu"/></div><div style={{flex:1,minWidth:90}}><div style={S.label}>Total (g)</div><input style={S.inp()} type="number" value={form.totalGrams} onChange={e=>sf("totalGrams",e.target.value)}/></div><div style={{flex:1,minWidth:90}}><div style={S.label}>Used (g)</div><input style={S.inp()} type="number" value={form.usedGrams} onChange={e=>sf("usedGrams",e.target.value)}/></div><div style={{flex:1,minWidth:90}}><div style={S.label}>Cost/g</div><input style={S.inp()} type="number" value={form.costPerGram} onChange={e=>sf("costPerGram",e.target.value)} placeholder="2.5"/></div><div style={{flex:1,minWidth:90}}><div style={S.label}>Alert (g)</div><input style={S.inp()} type="number" value={form.threshold} onChange={e=>sf("threshold",e.target.value)}/></div></div><div style={S.row({justifyContent:"flex-end"})}><button onClick={()=>setShowForm(false)} style={S.ghost()}>Cancel</button><button onClick={addMat} style={S.btn()}>Add</button></div></div></div>)}
+    {data.materials.length===0?<div style={{textAlign:"center",color:"#6b7280",padding:48}}>No materials tracked.</div>:<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:12}}>{data.materials.map(m=><MaterialCard key={m.id} m={m} currency={currency} onDelete={()=>delMat(m.id)} onUse={amt=>useMat(m.id,amt)}/>)}</div>}
+  </div>);
+}
+
+/* ── Backup & Settings ── */
+function Backup({data,save,currency,setCurrency,syncUser,syncStatus,onSignIn,onSignOut,onManualSync,clientId,saveClientId}){
+  const [importing,setImporting]=useState(false);const [importText,setImportText]=useState("");const [msg,setMsg]=useState(null);const [cidInput,setCidInput]=useState(clientId||"");
+  const flash=(text,ok=true)=>{setMsg({text,ok});setTimeout(()=>setMsg(null),5000);};
+  const exportJSON=()=>{const blob=new Blob([JSON.stringify({...data,exportedAt:new Date().toISOString()},null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`printops_backup_${new Date().toISOString().split("T")[0]}.json`;a.click();URL.revokeObjectURL(url);flash("✅ Downloaded!");};
+  const exportCSV=()=>{const hdr=["Order ID","Order Name","Customer","Phone","Status","Priority","Material","Color","Grams","Print Hours","Mat Cost","Elec Cost","Labor","Other","Total Cost","Quoted","Advance","Due","Margin%","Order Date","Deadline","Delivery","Address","Notes"];const rows=data.orders.map(o=>{const co=calcOrder(o);const cust=data.customers.find(c=>c.id===o.customerId);return[o.id,o.orderName,cust?.name||"",cust?.phone||"",o.status,o.priority,o.material,o.materialColor,o.materialGrams,o.printTimeHours,co.materialCost,co.electricityCost,o.laborCost,o.otherCosts,co.totalCost,o.quotedPrice,o.advancePaid,co.due,o.quotedPrice?Math.round(((o.quotedPrice-co.totalCost)/o.quotedPrice)*100)+"":0,o.orderDate,o.deadline,o.deliveryMethod,o.deliveryAddress,o.notes].map(v=>`"${(v??"")}"`).join(",");});const csv=[hdr.join(","),...rows].join("\n");const blob=new Blob([csv],{type:"text/csv"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`printops_orders_${new Date().toISOString().split("T")[0]}.csv`;a.click();URL.revokeObjectURL(url);flash("✅ CSV exported!");};
+  const doImport=()=>{try{const imp=JSON.parse(importText);if(!Array.isArray(imp.customers)||!Array.isArray(imp.orders))throw new Error();save(()=>imp);flash("✅ Data restored!");setImporting(false);setImportText("");}catch{flash("❌ Invalid JSON.",false);}};
+  const clearAll=()=>{if(!confirm("⚠️ CLEAR ALL DATA?"))return;if(!confirm("Last chance?"))return;save(()=>initData());flash("🗑 Cleared.");};
+  const totalRev=data.orders.filter(o=>o.status==="Delivered").reduce((s,o)=>s+(o.quotedPrice||0),0);
+  const totalDue=data.orders.filter(o=>o.status!=="Cancelled").reduce((s,o)=>s+Math.max(0,(o.quotedPrice||0)-(o.advancePaid||0)),0);
+  return(<div style={S.col()}>
+    <div style={{fontSize:20,fontWeight:800,color:"#f97316"}}>Backup & Settings</div>
+    {msg&&<div style={{background:msg.ok?"#162419":"#2a1515",border:`1px solid ${msg.ok?"#22c55e44":"#ef444444"}`,borderRadius:8,padding:12,color:msg.ok?"#22c55e":"#ef4444",fontWeight:600}}>{msg.text}</div>}
+
+    <div style={{...S.card(),background:"#131c2e",borderColor:"#3b82f644"}}>
+      <div style={{fontWeight:700,marginBottom:12,color:"#60a5fa",fontSize:15}}>🔵 Google Drive Sync</div>
+      {!syncUser?(<div style={S.col()}>
+        <div style={{fontSize:13,color:"#8b949e",lineHeight:1.7}}>Enter your Google OAuth Client ID to enable automatic cloud sync across all devices.</div>
+        <div style={S.row({alignItems:"flex-end",flexWrap:"wrap"})}>
+          <div style={{flex:1,minWidth:260}}><div style={S.label}>OAuth Client ID</div><input style={S.inp()} value={cidInput} onChange={e=>setCidInput(e.target.value)} placeholder="xxxx.apps.googleusercontent.com"/></div>
+          <button onClick={()=>cidInput.trim()&&saveClientId(cidInput.trim())} style={S.btn("#3b82f6")}>Save</button>
+        </div>
+        {clientId&&(<div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+          <div style={{fontSize:12,color:"#22c55e"}}>✓ Client ID saved</div>
+          <button onClick={onSignIn} style={{background:"#fff",color:"#374151",border:"none",borderRadius:8,padding:"8px 16px",cursor:"pointer",fontSize:13,fontWeight:600,display:"flex",alignItems:"center",gap:8}}>
+            <svg width="18" height="18" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+            Sign in with Google
+          </button>
+        </div>)}
+        <div style={{...S.card({background:"#0d1117",padding:"10px 12px"}),fontSize:12,color:"#6b7280",lineHeight:1.8}}>
+          <div style={{color:"#8b949e",fontWeight:600,marginBottom:4}}>Don't have a Client ID? See the Setup Guide below ↓</div>
+        </div>
+      </div>):(<div style={S.col()}>
+        <div style={{...S.row({alignItems:"center",gap:12}),flexWrap:"wrap"}}>
+          {syncUser.picture&&<img src={syncUser.picture} style={{width:40,height:40,borderRadius:"50%",border:"2px solid #3b82f644"}} referrerPolicy="no-referrer"/>}
+          <div><div style={{fontWeight:700}}>{syncUser.name}</div><div style={{fontSize:12,color:"#8b949e"}}>{syncUser.email}</div></div>
+          <div style={{marginLeft:"auto",display:"flex",gap:8,flexWrap:"wrap"}}><button onClick={onManualSync} style={S.btn("#3b82f6",{fontSize:12})}>🔄 Sync Now</button><button onClick={onSignOut} style={S.ghost({fontSize:12})}>Sign Out</button></div>
+        </div>
+        <div style={{background:"#162419",border:"1px solid #22c55e33",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#22c55e"}}>
+          {syncStatus==="syncing"||syncStatus==="connecting"?<span><span className="spin">⟳</span> {syncStatus==="connecting"?"Loading from Drive...":"Syncing..."}</span>:syncStatus==="synced"?"✓ All data synced to Google Drive":syncStatus==="error"?"⚠️ Sync error — data saved locally":"Connected"}
+        </div>
+        <div style={{fontSize:12,color:"#6b7280"}}>Auto-syncs 3 seconds after every change. Always saved locally too.</div>
+      </div>)}
+    </div>
+
+    <div style={S.card()}><div style={{fontWeight:700,marginBottom:12}}>⚙️ Settings</div><div><div style={S.label}>Currency</div><select style={{...S.inp({width:"auto"}),appearance:"none"}} value={currency} onChange={e=>{setCurrency(e.target.value);save(d=>({...d,currency:e.target.value}));}}>{CURRENCIES.map(c=><option key={c}>{c}</option>)}</select></div></div>
+    
+    <div style={S.card()}><div style={{fontWeight:700,marginBottom:12}}>📊 Summary</div><div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:10}}>{[{label:"Customers",val:data.customers.length,color:"#06b6d4"},{label:"Orders",val:data.orders.length,color:"#3b82f6"},{label:"Active",val:data.orders.filter(o=>!["Delivered","Cancelled"].includes(o.status)).length,color:"#f97316"},{label:"Materials",val:data.materials.length,color:"#a855f7"},{label:"Revenue",val:fmtMoney(totalRev,currency),color:"#22c55e"},{label:"Due",val:fmtMoney(totalDue,currency),color:"#ef4444"}].map(s=>(<div key={s.label} style={{textAlign:"center",padding:"10px 0"}}><div style={{fontSize:20,fontWeight:800,color:s.color}}>{s.val}</div><div style={{fontSize:11,color:"#6b7280"}}>{s.label}</div></div>))}</div></div>
+    
+    <div style={S.card()}><div style={{fontWeight:700,marginBottom:4}}>💾 Export</div><div style={{color:"#8b949e",fontSize:12,marginBottom:12}}>Download a local backup file.</div><div style={S.row({flexWrap:"wrap"})}><button onClick={exportJSON} style={S.btn("#3b82f6")}>⬇ JSON Backup</button><button onClick={exportCSV} style={S.btn("#22c55e")}>⬇ Orders CSV</button></div></div>
+    
+    <div style={S.card()}><div style={{fontWeight:700,marginBottom:4}}>📥 Restore</div>{!importing?<button onClick={()=>setImporting(true)} style={S.btn("#f97316")}>📂 Import JSON</button>:<div style={S.col()}><textarea style={{...S.inp(),minHeight:120,resize:"vertical",fontFamily:"monospace",fontSize:11}} value={importText} onChange={e=>setImportText(e.target.value)} placeholder='{"customers":[...],"orders":[...]}'/><div style={S.row({justifyContent:"flex-end"})}><button onClick={()=>setImporting(false)} style={S.ghost()}>Cancel</button><button onClick={doImport} style={S.btn()}>Restore</button></div></div>}</div>
+
+    <div style={{...S.card(),background:"#0e1f0e",borderColor:"#22c55e44"}}>
+      <div style={{fontWeight:700,marginBottom:12,color:"#22c55e",fontSize:14}}>🚀 Setup Guide: GitHub Pages + Google Drive</div>
+      <div style={{fontSize:13,color:"#8b949e",lineHeight:2.1}}>
+        <div style={{color:"#60a5fa",fontWeight:700,marginBottom:2}}>STEP 1 — Host on GitHub Pages</div>
+        <div>1. Go to <a href="https://github.com" target="_blank" style={{color:"#60a5fa"}}>github.com</a> → sign in or create a free account</div>
+        <div>2. Click <strong style={{color:"#e6edf3"}}>+</strong> → <strong style={{color:"#e6edf3"}}>New repository</strong> → name: <span style={{fontFamily:"monospace",color:"#f97316"}}>printops</span> → Public → Create</div>
+        <div>3. Click <strong style={{color:"#e6edf3"}}>Add file → Upload files</strong> → upload this <span style={{fontFamily:"monospace",color:"#f97316"}}>PrintOps.html</span> file</div>
+        <div>4. <strong style={{color:"#e6edf3"}}>Settings → Pages</strong> → Source: <em>Deploy from branch</em> → main → / (root) → Save</div>
+        <div>5. Your app URL: <span style={{fontFamily:"monospace",color:"#22c55e",fontSize:11}}>https://YOUR-USERNAME.github.io/printops/PrintOps.html</span></div>
+        <div style={{marginTop:6,color:"#60a5fa",fontWeight:700,marginBottom:2}}>STEP 2 — Google Cloud OAuth (for Drive sync)</div>
+        <div>1. Go to <a href="https://console.cloud.google.com" target="_blank" style={{color:"#60a5fa"}}>console.cloud.google.com</a> → create new project: <span style={{fontFamily:"monospace",color:"#f97316"}}>PrintOps</span></div>
+        <div>2. <strong style={{color:"#e6edf3"}}>APIs & Services → Enable APIs</strong> → search and enable <strong style={{color:"#e6edf3"}}>Google Drive API</strong></div>
+        <div>3. <strong style={{color:"#e6edf3"}}>APIs & Services → OAuth consent screen</strong> → External → fill App name + your email → Save</div>
+        <div>4. <strong style={{color:"#e6edf3"}}>Credentials → Create → OAuth 2.0 Client ID → Web application</strong></div>
+        <div>5. Under <em>Authorised JavaScript origins</em> add: <span style={{fontFamily:"monospace",color:"#22c55e",fontSize:11}}>https://YOUR-USERNAME.github.io</span></div>
+        <div>6. Copy the <strong style={{color:"#e6edf3"}}>Client ID</strong> → paste it in the Google Drive Sync box above → Sign In</div>
+        <div style={{marginTop:8,background:"#0d1117",borderRadius:6,padding:"8px 12px",fontSize:11,color:"#6b7280",lineHeight:1.8}}>
+          <div>⚠️ While in Testing mode, go to <strong style={{color:"#8b949e"}}>OAuth consent → Test users</strong> → add your own Gmail address.</div>
+          <div>💡 To use on phone: open the GitHub Pages URL in any mobile browser — it works like an app.</div>
+        </div>
+      </div>
+    </div>
+
+    <div style={{...S.card(),borderColor:"#ef444444",background:"#1f1010"}}><div style={{fontWeight:700,color:"#ef4444",marginBottom:4}}>⚠️ Danger Zone</div><div style={{color:"#8b949e",fontSize:12,marginBottom:10}}>Permanently deletes all local data.</div><button onClick={clearAll} style={S.btn("#ef4444")}>🗑 Clear All Data</button></div>
+  </div>);
+}
+
+/* ── Root App ── */
+function App(){
+  const [data,setData]=useState(null);const [tab,setTab]=useState("dashboard");const [currency,setCurrency]=useState("BDT");const [custView,setCustView]=useState(null);const [orderDetailId,setOrderDetailId]=useState(null);
+  const [syncUser,setSyncUser]=useState(null);const [syncStatus,setSyncStatus]=useState("idle");const [clientId,setClientIdState]=useState(()=>localStorage.getItem("printops_gci")||"");
+  const tokenRef=useRef(null);const fileIdRef=useRef(null);const tokenClientRef=useRef(null);const syncTimerRef=useRef(null);
+
+  useEffect(()=>{
+    dbLoad().then(d=>{const loaded=d||initData();setData(loaded);if(loaded.currency)setCurrency(loaded.currency);});
+    try{const u=localStorage.getItem("printops_guser");if(u)setSyncUser(JSON.parse(u));}catch{}
+  },[]);
+
+  const uploadToDrive=useCallback(async(d)=>{
+    if(!tokenRef.current)return;setSyncStatus("syncing");
+    try{
+      if(!fileIdRef.current)fileIdRef.current=await driveGetFileId(tokenRef.current);
+      await driveUpload(tokenRef.current,fileIdRef.current,d);
+      setSyncStatus("synced");
+    }catch{setSyncStatus("error");}
+  },[]);
+
+  const save=useCallback(updater=>{
+    setData(prev=>{
+      const next=typeof updater==="function"?updater(prev):updater;
+      dbSave(next);
+      if(tokenRef.current){clearTimeout(syncTimerRef.current);setSyncStatus("syncing");syncTimerRef.current=setTimeout(()=>uploadToDrive(next),3000);}
+      return next;
+    });
+  },[uploadToDrive]);
+
+  const initGoogleClient=useCallback((cid)=>{
+    const tryInit=()=>{
+      if(!window.google?.accounts?.oauth2){setTimeout(tryInit,300);return;}
+      tokenClientRef.current=google.accounts.oauth2.initTokenClient({
+        client_id:cid,
+        scope:"https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email",
+        callback:async(resp)=>{
+          if(resp.error){setSyncStatus("error");return;}
+          tokenRef.current=resp.access_token;setSyncStatus("connecting");
+          try{
+            const uRes=await fetch("https://www.googleapis.com/oauth2/v3/userinfo",{headers:{Authorization:`Bearer ${resp.access_token}`}});
+            const ui=await uRes.json();
+            const u={name:ui.name,email:ui.email,picture:ui.picture};
+            setSyncUser(u);localStorage.setItem("printops_guser",JSON.stringify(u));
+            fileIdRef.current=null;
+            const fid=await driveGetFileId(resp.access_token);fileIdRef.current=fid;
+            const dd=await driveDownload(resp.access_token,fid);
+            if(dd?.orders){setData(dd);dbSave(dd);if(dd.currency)setCurrency(dd.currency);}
+            setSyncStatus("synced");
+          }catch(e){console.error(e);setSyncStatus("error");}
+        }
+      });
+    };
+    tryInit();
+  },[]);
+
+  useEffect(()=>{if(clientId)initGoogleClient(clientId);},[clientId,initGoogleClient]);
+  const saveClientId=cid=>{setClientIdState(cid);localStorage.setItem("printops_gci",cid);initGoogleClient(cid);};
+  const handleSignIn=()=>tokenClientRef.current?.requestAccessToken();
+  const handleSignOut=()=>{if(tokenRef.current)try{google.accounts.oauth2.revoke(tokenRef.current);}catch{}tokenRef.current=null;fileIdRef.current=null;setSyncUser(null);setSyncStatus("idle");localStorage.removeItem("printops_guser");};
+  const handleManualSync=()=>{if(data&&tokenRef.current)uploadToDrive(data);};
+
+  if(!data)return(<div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100vh",background:"#0d1117",gap:16}}><div style={{width:48,height:48,background:"linear-gradient(135deg,#f97316,#ea580c)",borderRadius:12,display:"flex",alignItems:"center",justifyContent:"center",fontSize:24}}>🖨</div><div style={{color:"#f97316",fontFamily:"monospace",fontSize:16,letterSpacing:2}}>LOADING PRINTOPS...</div></div>);
+  const TABS=[{id:"dashboard",icon:"📊",label:"Dashboard"},{id:"customers",icon:"👥",label:"Customers"},{id:"orders",icon:"📦",label:"Orders"},{id:"materials",icon:"🧵",label:"Materials"},{id:"backup",icon:"💾",label:"Backup"}];
+  return(<div style={{fontFamily:"'Segoe UI',system-ui,sans-serif",background:"#0d1117",minHeight:"100vh",color:"#e6edf3"}}>
+    <header style={{background:"#161b22",borderBottom:"1px solid #21262d",padding:"10px 20px",display:"flex",alignItems:"center",gap:12,position:"sticky",top:0,zIndex:100,flexWrap:"wrap"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,flexShrink:0}}><div style={{width:34,height:34,background:"linear-gradient(135deg,#f97316,#ea580c)",borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>🖨</div><div><div style={{fontSize:14,fontWeight:800,color:"#f97316",letterSpacing:1.5}}>PRINTOPS</div><div style={{fontSize:10,color:"#4b5563",letterSpacing:0.5}}>3D Business Manager</div></div></div>
+      <nav style={{display:"flex",gap:4,flexWrap:"wrap"}}>{TABS.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{background:tab===t.id?"#f97316":"transparent",color:tab===t.id?"#fff":"#8b949e",border:"1px solid",borderColor:tab===t.id?"#f97316":"#30363d",borderRadius:6,padding:"6px 12px",cursor:"pointer",fontSize:12,fontWeight:600,display:"flex",alignItems:"center",gap:5,transition:"all 0.15s"}}><span>{t.icon}</span><span>{t.label}</span></button>)}</nav>
+      <div style={{marginLeft:"auto"}}><SyncBadge status={syncStatus} user={syncUser} onSignIn={handleSignIn} onSignOut={handleSignOut}/></div>
+    </header>
+    <main style={{padding:20,maxWidth:1160,margin:"0 auto"}}>
+      {tab==="dashboard"&&<Dashboard data={data} currency={currency} setTab={setTab} setDetailId={setOrderDetailId} onStatusChange={(id,status)=>save(d=>({...d,orders:d.orders.map(o=>o.id===id?{...o,status,updatedAt:new Date().toISOString()}:o)}))}/>}
+      {tab==="customers"&&<Customers data={data} save={save} currency={currency} view={custView} setView={setCustView} setDetailId={setOrderDetailId} setTab={setTab}/>}
+      {tab==="orders"&&<Orders data={data} save={save} currency={currency} detailId={orderDetailId} setDetailId={setOrderDetailId}/>}
+      {tab==="materials"&&<Materials data={data} save={save} currency={currency}/>}
+      {tab==="backup"&&<Backup data={data} save={save} currency={currency} setCurrency={setCurrency} syncUser={syncUser} syncStatus={syncStatus} onSignIn={handleSignIn} onSignOut={handleSignOut} onManualSync={handleManualSync} clientId={clientId} saveClientId={saveClientId}/>}
+    </main>
+  </div>);
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
