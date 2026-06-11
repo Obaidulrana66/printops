@@ -345,14 +345,18 @@ function App(){
     });
   },[uploadToDrive]);
 
-  const initGoogleClient=useCallback((cid)=>{
+  const initGoogleClient=useCallback((cid, autoSignIn=false)=>{
     const tryInit=()=>{
       if(!window.google?.accounts?.oauth2){setTimeout(tryInit,300);return;}
       tokenClientRef.current=google.accounts.oauth2.initTokenClient({
         client_id:cid,
         scope:"https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email",
         callback:async(resp)=>{
-          if(resp.error){setSyncStatus("error");return;}
+          if(resp.error){
+            // Silent sign-in failed — that's ok, just stay logged out
+            if(resp.error==="interaction_required"||resp.error==="access_denied")return;
+            setSyncStatus("error");return;
+          }
           tokenRef.current=resp.access_token;setSyncStatus("connecting");
           try{
             const uRes=await fetch("https://www.googleapis.com/oauth2/v3/userinfo",{headers:{Authorization:`Bearer ${resp.access_token}`}});
@@ -367,11 +371,21 @@ function App(){
           }catch(e){console.error(e);setSyncStatus("error");}
         }
       });
+      // If we have a saved user, try silent reconnect automatically
+      if(autoSignIn){
+        try{ tokenClientRef.current.requestAccessToken({prompt:""}); }catch(e){ console.log("Silent signin failed",e); }
+      }
     };
     tryInit();
   },[]);
 
-  useEffect(()=>{if(clientId)initGoogleClient(clientId);},[clientId,initGoogleClient]);
+  useEffect(()=>{
+    if(clientId){
+      // Auto-reconnect silently if user was previously signed in
+      const hadUser = !!localStorage.getItem("printops_guser");
+      initGoogleClient(clientId, hadUser);
+    }
+  },[clientId,initGoogleClient]);
   const saveClientId=cid=>{setClientIdState(cid);localStorage.setItem("printops_gci",cid);initGoogleClient(cid);};
   const handleSignIn=()=>tokenClientRef.current?.requestAccessToken();
   const handleSignOut=()=>{if(tokenRef.current)try{google.accounts.oauth2.revoke(tokenRef.current);}catch{}tokenRef.current=null;fileIdRef.current=null;setSyncUser(null);setSyncStatus("idle");localStorage.removeItem("printops_guser");};
