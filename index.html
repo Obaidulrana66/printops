@@ -33,7 +33,7 @@ const DELIVERY_TYPES=["Pickup","Courier","Hand Delivery"];
 const CURRENCIES=["BDT","USD","EUR","GBP","INR","SGD","AED"];
 
 function dbLoad(){try{const v=localStorage.getItem(STORAGE_KEY);return Promise.resolve(v?JSON.parse(v):null);}catch{return Promise.resolve(null);}}
-function dbSave(d){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(d));}catch(e){console.warn(e);}}
+function dbSave(d){try{localStorage.setItem(STORAGE_KEY,JSON.stringify({...d,_syncedAt:new Date().toISOString()}));}catch(e){console.warn(e);}}
 const initData=()=>({customers:[],orders:[],materials:[],currency:"BDT"});
 const calcOrder=o=>{const mat=(o.materialGrams||0)*(o.materialCostPerGram||0);const elec=(o.printTimeHours||0)*(o.electricityCostPerHour||0);const total=mat+elec+(o.laborCost||0)+(o.otherCosts||0);const due=Math.max(0,(o.quotedPrice||0)-(o.advancePaid||0));return{...o,materialCost:mat,electricityCost:elec,totalCost:total,due};};
 const fmtMoney=(n,cur="BDT")=>`${cur} ${Number(n||0).toLocaleString("en-IN",{maximumFractionDigits:0})}`;
@@ -58,13 +58,19 @@ async function driveReq(token,path,opts={}){
   try{return await res.json();}catch{return null;}
 }
 async function driveGetFileId(token){
-  const r=await driveReq(token,`files?spaces=appDataFolder&q=name%3D%22${DRIVE_FILE}%22&fields=files(id)`);
+  const res=await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name%3D%22${DRIVE_FILE}%22&fields=files(id)`,{headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"}});
+  if(res.status===401)throw new Error("TOKEN_EXPIRED");
+  const r=await res.json();
   if(r?.files?.length>0)return r.files[0].id;
-  const f=await driveReq(token,"files",{method:"POST",body:JSON.stringify({name:DRIVE_FILE,parents:["appDataFolder"]})});
+  const res2=await fetch("https://www.googleapis.com/drive/v3/files",{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify({name:DRIVE_FILE,parents:["appDataFolder"]})});
+  if(res2.status===401)throw new Error("TOKEN_EXPIRED");
+  const f=await res2.json();
   return f.id;
 }
 async function driveUpload(token,fileId,data){
-  await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,{method:"PATCH",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify({...data,_syncedAt:new Date().toISOString()})});
+  const res=await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,{method:"PATCH",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify({...data,_syncedAt:new Date().toISOString()})});
+  if(res.status===401)throw new Error("TOKEN_EXPIRED");
+  if(!res.ok)throw new Error(`Upload failed: ${res.status}`);
 }
 async function driveDownload(token,fileId){
   const res=await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,{headers:{Authorization:`Bearer ${token}`}});
@@ -79,7 +85,15 @@ function Modal({title,onClose,children,wide=false}){return(<div style={{position
 function ProgressBar({pct,color="#22c55e"}){return(<div style={{background:"#21262d",borderRadius:4,height:6,overflow:"hidden"}}><div style={{width:`${Math.min(100,Math.max(0,pct))}%`,background:color,borderRadius:4,height:"100%",transition:"width 0.4s"}}/></div>);}
 
 function SyncBadge({status,user,onSignIn,onSignOut}){
-  const cfg={idle:{bg:"#21262d",col:"#6b7280",icon:"☁️",txt:"Not connected"},connecting:{bg:"#1a2540",col:"#3b82f6",icon:"⟳",txt:"Connecting...",spin:true},syncing:{bg:"#2d2010",col:"#f97316",icon:"⟳",txt:"Syncing...",spin:true},synced:{bg:"#162419",col:"#22c55e",icon:"✓",txt:"Synced"},error:{bg:"#2a1515",col:"#ef4444",icon:"✕",txt:"Sync error"}}[status]||{bg:"#21262d",col:"#6b7280",icon:"☁️",txt:status};
+  const effectiveStatus = user && status==="idle" ? "ready" : status;
+  const cfg={
+    idle:{bg:"#21262d",col:"#6b7280",icon:"☁️",txt:"Not connected"},
+    ready:{bg:"#162419",col:"#22c55e",icon:"✓",txt:"Connected"},
+    connecting:{bg:"#1a2540",col:"#3b82f6",icon:"⟳",txt:"Connecting...",spin:true},
+    syncing:{bg:"#2d2010",col:"#f97316",icon:"⟳",txt:"Syncing...",spin:true},
+    synced:{bg:"#162419",col:"#22c55e",icon:"✓",txt:"Synced"},
+    error:{bg:"#2a1515",col:"#ef4444",icon:"✕",txt:"Sync error"}
+  }[effectiveStatus]||{bg:"#21262d",col:"#6b7280",icon:"☁️",txt:effectiveStatus};
   if(!user)return(<button onClick={onSignIn} style={{background:"#1a2540",color:"#60a5fa",border:"1px solid #3b82f644",borderRadius:6,padding:"5px 12px",cursor:"pointer",fontSize:11,fontWeight:600,display:"flex",alignItems:"center",gap:5}}><span>🔵</span><span>Connect Google</span></button>);
   return(<div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}><div style={{background:cfg.bg,border:`1px solid ${cfg.col}44`,borderRadius:6,padding:"4px 10px",fontSize:11,fontWeight:600,color:cfg.col,display:"flex",alignItems:"center",gap:4}}><span className={cfg.spin?"spin":""}>{cfg.icon}</span><span>{cfg.txt}</span></div>{user.picture&&<img src={user.picture} style={{width:24,height:24,borderRadius:"50%",border:`1px solid ${cfg.col}66`}} referrerPolicy="no-referrer"/>}<button onClick={onSignOut} title={`Sign out ${user.email}`} style={{background:"none",border:"1px solid #30363d",borderRadius:6,padding:"4px 8px",cursor:"pointer",color:"#6b7280",fontSize:11}}>Sign out</button></div>);
 }
@@ -241,7 +255,7 @@ function Backup({data,save,currency,setCurrency,syncUser,syncStatus,onSignIn,onS
   const [importing,setImporting]=useState(false);const [importText,setImportText]=useState("");const [msg,setMsg]=useState(null);const [cidInput,setCidInput]=useState(clientId||"");
   const flash=(text,ok=true)=>{setMsg({text,ok});setTimeout(()=>setMsg(null),5000);};
   const exportJSON=()=>{const blob=new Blob([JSON.stringify({...data,exportedAt:new Date().toISOString()},null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`printops_backup_${new Date().toISOString().split("T")[0]}.json`;a.click();URL.revokeObjectURL(url);flash("✅ Downloaded!");};
-  const exportCSV=()=>{const hdr=["Order ID","Order Name","Customer","Phone","Status","Priority","Material","Color","Grams","Print Hours","Mat Cost","Elec Cost","Labor","Other","Total Cost","Quoted","Advance","Due","Margin%","Order Date","Deadline","Delivery","Address","Notes"];const rows=data.orders.map(o=>{const co=calcOrder(o);const cust=data.customers.find(c=>c.id===o.customerId);return[o.id,o.orderName,cust?.name||"",cust?.phone||"",o.status,o.priority,o.material,o.materialColor,o.materialGrams,o.printTimeHours,co.materialCost,co.electricityCost,o.laborCost,o.otherCosts,co.totalCost,o.quotedPrice,o.advancePaid,co.due,o.quotedPrice?Math.round(((o.quotedPrice-co.totalCost)/o.quotedPrice)*100)+"":0,o.orderDate,o.deadline,o.deliveryMethod,o.deliveryAddress,o.notes].map(v=>`"${(v??"")}"`).join(",");});const csv=[hdr.join(","),...rows].join("\n");const blob=new Blob([csv],{type:"text/csv"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`printops_orders_${new Date().toISOString().split("T")[0]}.csv`;a.click();URL.revokeObjectURL(url);flash("✅ CSV exported!");};
+  const exportCSV=()=>{const hdr=["Order ID","Order Name","Customer","Phone","Status","Priority","Material","Color","Grams","Print Hours","Mat Cost","Elec Cost","Labor","Other","Total Cost","Quoted","Advance","Due","Margin%","Order Date","Deadline","Delivery","Address","Notes"];const rows=data.orders.map(o=>{const co=calcOrder(o);const cust=data.customers.find(c=>c.id===o.customerId);return[o.id,o.orderName,cust?.name||"",cust?.phone||"",o.status,o.priority,o.material,o.materialColor,o.materialGrams,o.printTimeHours,co.materialCost,co.electricityCost,o.laborCost,o.otherCosts,co.totalCost,o.quotedPrice,o.advancePaid,co.due,o.quotedPrice?Math.round(((o.quotedPrice-co.totalCost)/o.quotedPrice)*100)+"":0,o.orderDate,o.deadline,o.deliveryMethod,o.deliveryAddress,o.notes].map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",");});const csv=[hdr.join(","),...rows].join("\n");const blob=new Blob([csv],{type:"text/csv"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`printops_orders_${new Date().toISOString().split("T")[0]}.csv`;a.click();URL.revokeObjectURL(url);flash("✅ CSV exported!");};
   const doImport=()=>{try{const imp=JSON.parse(importText);if(!Array.isArray(imp.customers)||!Array.isArray(imp.orders))throw new Error();save(()=>imp);flash("✅ Data restored!");setImporting(false);setImportText("");}catch{flash("❌ Invalid JSON.",false);}};
   const clearAll=()=>{if(!confirm("⚠️ CLEAR ALL DATA?"))return;if(!confirm("Last chance?"))return;save(()=>initData());flash("🗑 Cleared.");};
   const totalRev=data.orders.filter(o=>o.status==="Delivered").reduce((s,o)=>s+(o.quotedPrice||0),0);
@@ -320,25 +334,69 @@ function Backup({data,save,currency,setCurrency,syncUser,syncStatus,onSignIn,onS
 function App(){
   const [data,setData]=useState(null);const [tab,setTab]=useState("dashboard");const [currency,setCurrency]=useState("BDT");const [custView,setCustView]=useState(null);const [orderDetailId,setOrderDetailId]=useState(null);
   const [syncUser,setSyncUser]=useState(null);const [syncStatus,setSyncStatus]=useState("idle");const [clientId,setClientIdState]=useState(()=>localStorage.getItem("printops_gci")||"");
-  const tokenRef=useRef(null);const fileIdRef=useRef(null);const tokenClientRef=useRef(null);const syncTimerRef=useRef(null);
+  const tokenRef=useRef(null);const fileIdRef=useRef(null);const tokenClientRef=useRef(null);const syncTimerRef=useRef(null);const tokenTimeRef=useRef(null);const dataRef=useRef(null);
 
   useEffect(()=>{
-    dbLoad().then(d=>{const loaded=d||initData();setData(loaded);if(loaded.currency)setCurrency(loaded.currency);});
+    dbLoad().then(d=>{const loaded=d||initData();dataRef.current=loaded;setData(loaded);if(loaded.currency)setCurrency(loaded.currency);});
     try{const u=localStorage.getItem("printops_guser");if(u)setSyncUser(JSON.parse(u));}catch{}
   },[]);
 
+  const silentRefreshToken=useCallback(()=>{
+    return new Promise((resolve,reject)=>{
+      const cid=localStorage.getItem("printops_gci");
+      if(!cid||!window.google?.accounts?.oauth2){reject("no_client");return;}
+      const tc=google.accounts.oauth2.initTokenClient({
+        client_id:cid,
+        scope:"https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email",
+        callback:(resp)=>{
+          if(resp.error){reject(resp.error);return;}
+          tokenRef.current=resp.access_token;
+          tokenTimeRef.current=Date.now();
+          resolve(resp.access_token);
+        }
+      });
+      tc.requestAccessToken({prompt:""});
+    });
+  },[]);
+
   const uploadToDrive=useCallback(async(d)=>{
-    if(!tokenRef.current)return;setSyncStatus("syncing");
-    try{
+    if(!tokenRef.current)return;
+    setSyncStatus("syncing");
+    const doUpload=async()=>{
       if(!fileIdRef.current)fileIdRef.current=await driveGetFileId(tokenRef.current);
       await driveUpload(tokenRef.current,fileIdRef.current,d);
+    };
+    try{
+      // Proactively refresh if token is older than 50 minutes
+      const tokenAge=Date.now()-(tokenTimeRef.current||0);
+      if(tokenAge>50*60*1000){
+        try{await silentRefreshToken();}catch(e){console.log("Proactive refresh failed",e);}
+      }
+      await doUpload();
       setSyncStatus("synced");
-    }catch{setSyncStatus("error");}
-  },[]);
+    }catch(e){
+      if(e.message==="TOKEN_EXPIRED"||e.message?.includes("401")){
+        // Token expired — refresh and retry once
+        try{
+          await silentRefreshToken();
+          fileIdRef.current=null; // reset file id too
+          await doUpload();
+          setSyncStatus("synced");
+        }catch(e2){
+          console.error("Retry after token refresh failed",e2);
+          setSyncStatus("error");
+        }
+      } else {
+        console.error("Upload error",e);
+        setSyncStatus("error");
+      }
+    }
+  },[silentRefreshToken]);
 
   const save=useCallback(updater=>{
     setData(prev=>{
       const next=typeof updater==="function"?updater(prev):updater;
+      dataRef.current=next;
       dbSave(next);
       if(tokenRef.current){clearTimeout(syncTimerRef.current);setSyncStatus("syncing");syncTimerRef.current=setTimeout(()=>uploadToDrive(next),3000);}
       return next;
@@ -357,7 +415,7 @@ function App(){
             if(resp.error==="interaction_required"||resp.error==="access_denied")return;
             setSyncStatus("error");return;
           }
-          tokenRef.current=resp.access_token;setSyncStatus("connecting");
+          tokenRef.current=resp.access_token;tokenTimeRef.current=Date.now();setSyncStatus("connecting");
           try{
             const uRes=await fetch("https://www.googleapis.com/oauth2/v3/userinfo",{headers:{Authorization:`Bearer ${resp.access_token}`}});
             const ui=await uRes.json();
@@ -366,7 +424,27 @@ function App(){
             fileIdRef.current=null;
             const fid=await driveGetFileId(resp.access_token);fileIdRef.current=fid;
             const dd=await driveDownload(resp.access_token,fid);
-            if(dd?.orders){setData(dd);dbSave(dd);if(dd.currency)setCurrency(dd.currency);}
+            const local=dataRef.current;
+            const localCount=(local?.orders?.length||0)+(local?.customers?.length||0);
+            const driveCount=(dd?.orders?.length||0)+(dd?.customers?.length||0);
+            if(dd?.orders){
+              // Pick the newer dataset by _syncedAt; if local is newer/bigger and drive is empty, push local up
+              const driveTime=dd._syncedAt?new Date(dd._syncedAt).getTime():0;
+              const localTime=local?._syncedAt?new Date(local._syncedAt).getTime():0;
+              if(driveCount===0&&localCount>0){
+                // Drive empty but we have local data — upload local instead of wiping it
+                await driveUpload(resp.access_token,fid,local);
+              } else if(localTime>driveTime&&localCount>=driveCount){
+                // Local is newer — keep local, push to drive
+                await driveUpload(resp.access_token,fid,local);
+              } else {
+                // Drive is source of truth
+                dataRef.current=dd;setData(dd);dbSave(dd);if(dd.currency)setCurrency(dd.currency);
+              }
+            } else if(localCount>0){
+              // No drive file content yet — upload local
+              await driveUpload(resp.access_token,fid,local);
+            }
             setSyncStatus("synced");
           }catch(e){console.error(e);setSyncStatus("error");}
         }
